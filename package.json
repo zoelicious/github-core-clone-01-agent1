@@ -1,0 +1,1 @@
+{"description":"A GitHub-compatible git forge: smart-HTTP git, REST v3, GraphQL and MCP over one in-memory store, stdlib only","engines":{"node":">=22.18"},"license":"MIT","name":"forge","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.0.0"}
