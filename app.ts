@@ -83,7 +83,8 @@ export function createApp(store: Store = new Store()) {
             path === '/api/graphql' ||
             path === '/mcp';
           if (needsAuth) {
-            sendJson(res, 401, { message: 'Requires authentication' });
+            store.reqCounter += 1;
+            sendJson(res, 401, { message: 'Requires authentication' }, { 'X-GitHub-Request-Id': `req-${store.reqCounter}` });
             return;
           }
         }

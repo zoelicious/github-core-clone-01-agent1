@@ -86,7 +86,9 @@ export function decodePackets(buf: Buffer): { packets: Packet[]; rest: Buffer } 
 
 export function packetLines(packets: readonly Packet[]): string[] {
   const out: string[] = [];
-  for (const p of packets) if (p.kind === 'data') out.push(p.payload.toString('utf8'));
+  // Wire lines are newline-terminated inside their pkt-line framing; the
+  // trailing newline is framing, not content, so strip it per line.
+  for (const p of packets) if (p.kind === 'data') out.push(p.payload.toString('utf8').replace(/\r?\n$/, ''));
   return out;
 }
 

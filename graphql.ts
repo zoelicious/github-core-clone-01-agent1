@@ -34,7 +34,7 @@ function tokenize(src: string): Tok[] {
       i += 3;
       continue;
     }
-    if ('!$():=@[]{ }|'.includes(c)) {
+    if ('!():=@[]{ }|'.includes(c)) {
       toks.push({ kind: 'punct', value: c });
       i += 1;
       continue;

@@ -140,7 +140,7 @@ export function handleRest(ctx: RestCtx): RestReply | null {
     }
     if (rest.length === 2) {
       const branch = rest[1]!;
-      const sha = repo.branchTip(branch);
+      const sha = store.branchTip(repo, branch);
       if (!sha) return err(404, 'Not Found');
       if (method !== 'GET') return err(404, 'Not Found');
       return ok(200, { name: branch, commit: { sha } });
@@ -172,7 +172,7 @@ export function handleRest(ctx: RestCtx): RestReply | null {
     }
     if (method === 'GET' && rest.length >= 4 && rest[2] === 'heads') {
       const branch = rest.slice(3).join('/');
-      const sha = repo.branchTip(branch);
+      const sha = store.branchTip(repo, branch);
       if (!sha) return err(404, 'Not Found');
       return ok(200, { ref: `refs/heads/${branch}`, object: { sha } });
     }

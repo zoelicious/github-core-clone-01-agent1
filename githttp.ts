@@ -9,7 +9,7 @@
 // command. A malformed receive-pack body is answered with an error status
 // and never crashes the process.
 
-import { readPack, writePack, pktLine, pktFlush, pktDelim, decodePackets, packetLines, ZERO_OID, isOid, parseCommit, type GitObject } from './gitobj.ts';
+import { readPack, writePack, pktLine, pktFlush, pktDelim, decodePackets, packetLines, ZERO_OID, isOid, parseCommit, parseTag, parseTree, type GitObject } from './gitobj.ts';
 import { Store, DEFAULT_BRANCH, type Repo } from './store.ts';
 
 const CAP_UPLOAD_V0 = 'symref=HEAD:refs/heads/main side-band-64k ofs-delta thin-pack multi_ack shallow';
@@ -74,7 +74,7 @@ interface FetchPlan {
   thinPack: boolean;
 }
 
-function collectCommits(repo: Repo, roots: string[], limitDepth: number | null): { commits: string[]; depth: Map<string, number> } {
+function collectCommits(store: Store, repo: Repo, roots: string[], limitDepth: number | null): { commits: string[]; depth: Map<string, number> } {
   // BFS by generation depth: root depth 0, parents +1. Stops before going
   // past `limitDepth` generations when set. Shallow sentinels are handled
   // by the caller trimming with `boundaryRoots`.
@@ -82,7 +82,7 @@ function collectCommits(repo: Repo, roots: string[], limitDepth: number | null):
   const commits: string[] = [];
   const queue: string[] = [];
   for (const r of roots) {
-    const peeled = repo.peelToCommit(r);
+    const peeled = store.peelToCommit(repo, r);
     if (peeled && !depth.has(peeled)) {
       depth.set(peeled, 0);
       queue.push(peeled);
@@ -111,6 +111,75 @@ function collectCommits(repo: Repo, roots: string[], limitDepth: number | null):
   return { commits, depth };
 }
 
+/** Objects reachable from `included` commits without following parent commits outside the set: collectCommits already applied the depth limit, and a full reachable() walk would silently re-add the whole history (breaking shallow depth-1 clones). */
+function reachableWithin(repo: Repo, included: Set<string>): Set<string> {
+  const seen = new Set<string>();
+  const queue = [...included];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      try {
+        queue.push(parseCommit(obj.data).tree);
+      } catch {
+        /* ignore */
+      }
+      // Parents deliberately NOT followed.
+    } else if (obj.type === 'tag') {
+      try {
+        queue.push(parseTag(obj.data).object);
+      } catch {
+        /* ignore */
+      }
+    } else if (obj.type === 'tree') {
+      try {
+        for (const e of parseTree(obj.data)) if (e.mode !== '160000') queue.push(e.oid);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return seen;
+}
+
+/** Objects the client already holds: closure of held commits, but never across a shallow boundary — a shallow tip's parent is NOT held, even though the client sent the tip as a have. */
+function reachableHeld(repo: Repo, held: Set<string>, shallow: Set<string>): Set<string> {
+  const seen = new Set<string>();
+  const queue = [...held];
+  while (queue.length) {
+    const oid = queue.pop()!;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      try {
+        const c = parseCommit(obj.data);
+        queue.push(c.tree);
+        if (!shallow.has(oid)) for (const p of c.parents) queue.push(p);
+      } catch {
+        /* ignore */
+      }
+    } else if (obj.type === 'tag') {
+      try {
+        queue.push(parseTag(obj.data).object);
+      } catch {
+        /* ignore */
+      }
+    } else if (obj.type === 'tree') {
+      try {
+        for (const e of parseTree(obj.data)) if (e.mode !== '160000') queue.push(e.oid);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return seen;
+}
+
 interface FetchSelection {
   objects: GitObject[];
   shallowOut: string[];
@@ -119,8 +188,8 @@ interface FetchSelection {
 }
 
 /** The core fetch selection shared by v0 and v2 upload-pack. */
-function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
-  const heldRoots = new Set(plan.haves.map((h) => repo.peelToCommit(h)).filter((x): x is string => x !== null));
+function selectFetch(store: Store, repo: Repo, plan: FetchPlan): FetchSelection {
+  const heldRoots = new Set(plan.haves.map((h) => store.peelToCommit(repo, h)).filter((x): x is string => x !== null));
   const heldCommits = new Set<string>();
   {
     // Walk held commits but do not traverse past a shallow boundary.
@@ -143,24 +212,28 @@ function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
     }
   }
   const limitDepth = plan.deepen !== null ? plan.deepen - 1 : null;
-  const { commits: included, depth } = collectCommits(repo, plan.wants, limitDepth);
+  const { commits: included, depth } = collectCommits(store, repo, plan.wants, limitDepth);
   // Shallow boundaries inside the included set: a commit whose parent was
   // not included (because of depth) or which the client sent as shallow.
   const includedSet = new Set(included);
   const shallowOut = new Set<string>();
   for (const c of included) {
-    if (plan.shallow.includes(c)) shallowOut.add(c);
     const obj = repo.objects.get(c);
-    if (!obj || obj.type !== 'commit') continue;
+    if (!obj || obj.type !== 'commit') {
+      if (plan.shallow.includes(c)) shallowOut.add(c);
+      continue;
+    }
     let parents: string[] = [];
     try {
       parents = parseCommit(obj.data).parents;
     } catch {
       parents = [];
     }
-    for (const p of parents) {
-      if (!includedSet.has(p)) shallowOut.add(c);
-    }
+    // A boundary remains only while some parent is missing: a previously
+    // shallow commit whose parents are all included now is unshallowed
+    // (the unshallow loop below reports it), not shallow again.
+    const missingParent = parents.some((p) => !includedSet.has(p));
+    if (plan.shallow.includes(c) ? parents.length === 0 || missingParent : missingParent) shallowOut.add(c);
   }
   const unshallow: string[] = [];
   for (const s of plan.shallow) {
@@ -179,8 +252,8 @@ function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
     }
   }
   void depth;
-  const includedObjects = repo.reachable(included);
-  const heldObjects = repo.reachable([...heldCommits]);
+  const includedObjects = reachableWithin(repo, includedSet);
+  const heldObjects = reachableHeld(repo, heldCommits, new Set(plan.shallow));
   // Tag objects peeled from a wanted tag oid travel with the pack.
   for (const w of plan.wants) {
     const obj = repo.objects.get(w);
@@ -201,7 +274,7 @@ function selectFetch(repo: Repo, plan: FetchPlan): FetchSelection {
   // a want. All wants are satisfied by the first shared commit, if any.
   let ack: string | null = null;
   for (const h of plan.haves) {
-    const peeled = repo.peelToCommit(h);
+    const peeled = store.peelToCommit(repo, h);
     if (peeled && includedSet.has(peeled)) {
       ack = peeled;
       break;
@@ -306,28 +379,30 @@ function parseFetchArgs(args: string[]): FetchPlan {
   return plan;
 }
 
-function v2FetchResponse(repo: Repo, plan: FetchPlan): Buffer {
-  const sel = selectFetch(repo, plan);
-  const parts: Buffer[] = [pktLine('acknowledgments')];
-  parts.push(pktLine(sel.ack !== null ? `ACK ${sel.ack}` : 'NAK'));
-  if (sel.ack !== null) parts.push(pktLine('ready'));
+function v2FetchResponse(store: Store, repo: Repo, plan: FetchPlan): Buffer {
+  const sel = selectFetch(store, repo, plan);
+  // v2 section headers are matched by the client with their trailing
+  // newline ('acknowledgments\n'); without it the section is rejected.
+  const parts: Buffer[] = [pktLine('acknowledgments\n')];
+  parts.push(pktLine(sel.ack !== null ? `ACK ${sel.ack}\n` : 'NAK\n'));
+  if (sel.ack !== null) parts.push(pktLine('ready\n'));
   parts.push(pktDelim());
   if (sel.shallowOut.length > 0 || sel.unshallow.length > 0) {
-    parts.push(pktLine('shallow-info'));
-    for (const s of sel.shallowOut) parts.push(pktLine(`shallow ${s}`));
-    for (const u of sel.unshallow) parts.push(pktLine(`unshallow ${u}`));
+    parts.push(pktLine('shallow-info\n'));
+    for (const s of sel.shallowOut) parts.push(pktLine(`shallow ${s}\n`));
+    for (const u of sel.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
     parts.push(pktDelim());
   }
   if (sel.objects.length > 0) {
-    parts.push(pktLine('packfile'));
+    parts.push(pktLine('packfile\n'));
     parts.push(sidebandPack(sel.objects));
   }
   parts.push(pktFlush());
   return Buffer.concat(parts);
 }
 
-function v0FetchResponse(repo: Repo, plan: FetchPlan): Buffer {
-  const sel = selectFetch(repo, plan);
+function v0FetchResponse(store: Store, repo: Repo, plan: FetchPlan): Buffer {
+  const sel = selectFetch(store, repo, plan);
   const parts: Buffer[] = [];
   if (sel.ack !== null) parts.push(pktLine(`ACK ${sel.ack}`));
   else parts.push(pktLine('NAK'));
@@ -347,7 +422,7 @@ export function uploadPack(store: Store, owner: string, repoName: string, body: 
       const { packets } = decodePackets(body);
       const lines = packetLines(packets);
       const plan = parseFetchArgs(lines);
-      return result(200, 'application/x-git-upload-pack-result', v0FetchResponse(repo, plan));
+      return result(200, 'application/x-git-upload-pack-result', v0FetchResponse(store, repo, plan));
     }
     const { packets } = decodePackets(body);
     const lines = packetLines(packets);
@@ -358,7 +433,7 @@ export function uploadPack(store: Store, owner: string, repoName: string, body: 
     }
     if (command === 'command=fetch') {
       const plan = parseFetchArgs(args);
-      return result(200, 'application/x-git-upload-pack-result', v2FetchResponse(repo, plan));
+      return result(200, 'application/x-git-upload-pack-result', v2FetchResponse(store, repo, plan));
     }
     return result(400, 'application/json', JSON.stringify({ message: `unknown upload-pack command ${command}` }));
   } catch (err) {
@@ -386,7 +461,9 @@ export function receivePack(store: Store, owner: string, repoName: string, body:
     const lines: string[] = [];
     if (rest.length > 0) {
       const objects = readPack(rest, (oid) => repo.objects.get(oid));
-      for (const o of objects.values()) repo.objects.set(o.oid, o);
+      // readPack returns Map<oid, object>: the oid is the key, not a field
+      // of the value (o.oid is undefined) — store by the map key.
+      for (const [oid, o] of objects) repo.objects.set(oid, o);
       lines.push('unpack ok');
     } else {
       lines.push('unpack ok');
@@ -403,9 +480,9 @@ export function receivePack(store: Store, owner: string, repoName: string, body:
       } else {
         const newObj = repo.objects.get(cmd.newOid);
         if (newObj) {
-          const newCommit = repo.peelToCommit(cmd.newOid);
+          const newCommit = store.peelToCommit(repo, cmd.newOid);
           if (newCommit && current === cmd.oldOid) {
-            if (cmd.oldOid === ZERO_OID || repo.isAncestor(cmd.oldOid, newCommit)) {
+            if (cmd.oldOid === ZERO_OID || store.isAncestor(repo, cmd.oldOid, newCommit)) {
               repo.refs.set(cmd.ref, cmd.newOid);
               ok = true;
             }
@@ -414,13 +491,16 @@ export function receivePack(store: Store, owner: string, repoName: string, body:
       }
       lines.push(ok ? `ok ${cmd.ref}` : `ng ${cmd.ref} ${reason}`);
     }
-    const report = Buffer.concat(lines.map((l) => pktLine(l)));
+    // Report-status lines are newline-terminated on the wire: without the
+    // newline the client concatenates "unpack ok" + "ng ..." into one line
+    // and reads the unpack as failed.
+    const report = Buffer.concat(lines.map((l) => pktLine(`${l}\n`)));
     const bodyOut = Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), pktFlush()]);
     return result(200, 'application/x-git-receive-pack-result', bodyOut);
   } catch (err) {
     // Never crash on a bad push body: report the unpack failure and stay up.
     const message = (err as Error).message;
-    const report = Buffer.concat([pktLine(`unpack ${message}`), pktLine('ng refs/heads/main unpack-failed')]);
+    const report = Buffer.concat([pktLine('unpack ' + message + '\n'), pktLine('ng refs/heads/main unpack-failed\n')]);
     const bodyOut = Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), pktFlush()]);
     return result(200, 'application/x-git-receive-pack-result', bodyOut);
   }
