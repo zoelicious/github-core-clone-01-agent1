@@ -258,16 +258,16 @@ function handleLsRefs(repo: Repo, args: string[]): Buffer {
   const wantPeel = args.includes('peel');
   const wantSymrefs = args.includes('symrefs');
   const wantUnborn = args.includes('unborn');
-  let prefix: string | null = null;
+  const prefixes: string[] = [];
   for (const a of args) {
-    if (a.startsWith('ref-prefix ')) prefix = a.slice('ref-prefix '.length);
+    if (a.startsWith('ref-prefix ')) prefixes.push(a.slice('ref-prefix '.length));
   }
   const lines: Buffer[] = [];
   const refs = sortedRefs(repo);
   const head = headOid(repo);
-  const matches = (name: string): boolean => (prefix === null ? true : name.startsWith(prefix));
+  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   if (refs.length === 0) {
-    if (wantUnborn && matches('HEAD')) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main'));
+    if (wantUnborn) lines.push(pktLine('unborn HEAD symref-target:refs/heads/main'));
   } else {
     if (matches('HEAD')) {
       let line = `${head} HEAD`;

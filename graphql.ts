@@ -131,7 +131,10 @@ interface Operation {
 
 class Parser {
   private pos = 0;
-  constructor(private readonly toks: Tok[]) {}
+  private readonly toks: Tok[];
+  constructor(toks: Tok[]) {
+    this.toks = toks;
+  }
 
   private peek(): Tok | undefined {
     return this.toks[this.pos];
@@ -714,7 +717,7 @@ function resolveField(parentType: string, parent: unknown, field: FieldNode, ctx
       case 'owner':
         return T('RepositoryOwner', { login, id: '1' });
       case 'defaultBranchRef':
-        return T('Ref', { name: DEFAULT_BRANCH, target: repo.branchTip(DEFAULT_BRANCH) });
+        return T('Ref', { name: DEFAULT_BRANCH, target: store.branchTip(repo, DEFAULT_BRANCH) });
       case 'viewerPermission':
         return T('RepositoryPermission', 'ADMIN');
       case 'hasIssuesEnabled':
@@ -832,9 +835,9 @@ function resolveField(parentType: string, parent: unknown, field: FieldNode, ctx
       case 'baseRefName':
         return T('String', pull.baseRef);
       case 'headRefOid':
-        return T('String', repo.branchTip(pull.headRef) ?? pull.headSha);
+        return T('String', store.branchTip(repo, pull.headRef) ?? pull.headSha);
       case 'baseRefOid':
-        return T('String', repo.branchTip(pull.baseRef) ?? pull.baseSha);
+        return T('String', store.branchTip(repo, pull.baseRef) ?? pull.baseSha);
       case 'mergeable': {
         if (pull.state !== 'open') return T('MergeableState', 'UNKNOWN');
         return T('MergeableState', store.pullConflict(repo, pull) ? 'CONFLICTING' : 'MERGEABLE');

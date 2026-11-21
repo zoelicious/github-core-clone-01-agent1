@@ -5,8 +5,8 @@
 // delta *resolution* on the read side, for thin packs a client may send).
 // Pkt-lines are the 4-hex-length framing both smart-HTTP protocols use.
 
-import { createHash, deflateSync, inflateSync } from 'node:crypto';
-import { inflateSync as zlibInflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { deflateSync, inflateSync as zlibInflateSync } from 'node:zlib';
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 
